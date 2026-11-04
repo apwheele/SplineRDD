@@ -1,0 +1,642 @@
+---
+title: "Just use regression (most of the time) for RDD"
+author: "Andrew P. Wheeler"
+abstract: |
+  Regression discontinuity designs are now usually estimated with local
+  linear kernel regression and a data-driven bandwidth, via the rdrobust
+  software. I compare that estimator to regression splines fit to all of the
+  data with a dummy variable at the cutoff, and to random forests and XGBoost
+  with conformal intervals for the counterfactual, in simulations with 100 to
+  5,000 cases. When the treatment shifts the outcome curve without changing
+  its shape, the spline is much more efficient. The kernel estimator needs
+  1.6 to 2.2 times as much data to match it, and with knots fixed in advance
+  the spline's intervals are 25% to 40% shorter with correct coverage. With
+  100 cases the kernel estimator is erratic. When the shape changes at the
+  cutoff, as in the two benchmark designs used to develop rdrobust, the
+  common spline is biased and its intervals can cover the true effect as
+  little as 60% of the time, while splines that let the shape change do about
+  as well as the kernel estimator. Leave-one-out and k-fold prediction error
+  do not reliably pick the better model. Tree models are biased at the
+  cutoff, and conformal intervals for the average effect only approach their
+  nominal coverage when they are built from errors that mimic extrapolating
+  across the cutoff. In Washington State drunk driving data, the kernel
+  estimator cannot detect the effect of the 0.08 blood alcohol threshold on
+  recidivism with over 100,000 stops, while simple regressions can. Code and
+  data are at https://github.com/apwheele/SplineRDD.
+bibliography: references.bib
+link-citations: true
+format:
+  pdf:
+    documentclass: article
+    geometry: margin=1in
+    number-sections: true
+    fig-pos: "H"
+    header-includes:
+      - \usepackage{float}
+      - \usepackage{booktabs}
+  gfm:
+    fig-dpi: 150
+    wrap: none
+    filters:
+      - filters/github-math.lua
+execute:
+  echo: false
+  warning: false
+  message: false
+jupyter: splinerdd
+---
+
+```{python}
+#| label: setup
+import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+from splinerdd import report as R
+from splinerdd.dgp import DGPS
+
+andy_theme = {
+    "axes.grid": True,
+    "grid.linestyle": "--",
+    "grid.color": "#d9d8d4",
+    "legend.framealpha": 1,
+    "legend.facecolor": "white",
+    "legend.shadow": True,
+    "legend.fontsize": 8,
+    "xtick.labelsize": 9,
+    "ytick.labelsize": 9,
+    "axes.labelsize": 10,
+    "axes.titlesize": 11,
+    "axes.titlelocation": "left",
+    "figure.dpi": 150,
+}
+matplotlib.rcParams.update(andy_theme)
+
+num = lambda v, d=2: "--" if pd.isna(v) else f"{round(v, d) + 0.0:.{d}f}"
+pct = lambda v, d=0: "--" if pd.isna(v) else f"{v * 100:.{d}f}%"
+com = lambda v: "--" if pd.isna(v) else f"{int(round(v)):,}"
+
+STYLE = {
+    "rdrobust": {"color": "#2a78d6", "marker": "o"},
+    "spline_mid": {"color": "#eb6834", "marker": "s"},
+    "spline_at": {"color": "#1baf7a", "marker": "^"},
+    "spline_kink": {"color": "#b07a00", "marker": "D"},
+    "spline_sep": {"color": "#d55181", "marker": "v"},
+    "rf": {"color": "#008300", "marker": "P"},
+    "xgb": {"color": "#6250d6", "marker": "X"},
+}
+SIZES = [100, 500, 1000, 5000]
+
+df = R.sims()
+summ = R.summary(df)
+REPS_FAST = int(df.loc[df.model == "rdrobust"].groupby(["dgp", "n"]).size().min())
+REPS_TREES = int(df.loc[df.model == "rf"].groupby(["dgp", "n"]).size().min())
+conf = R.conformal_summary(df, max_rep=REPS_TREES)
+fk = R.fixed_knots_summary()
+
+
+def FK(dgp, n, model, rule, col):
+    q = fk[(fk.dgp == dgp) & (fk.n == n) & (fk.model == model) & (fk.rule == rule)]
+    return q.iloc[0][col] if len(q) else np.nan
+
+
+def S(dgp, n, model, col):
+    q = summ[(summ.dgp == dgp) & (summ.n == n) & (summ.model == model)]
+    return q.iloc[0][col] if len(q) else np.nan
+
+
+def C(dgp, n, model, col):
+    q = conf[(conf.dgp == dgp) & (conf.n == n) & (conf.model == model)]
+    return q.iloc[0][col] if len(q) else np.nan
+
+
+def data_ratio(dgp, n, a, b):
+    """How many times more data model a needs to match model b's RMSE."""
+    return (S(dgp, n, a, "rmse") / S(dgp, n, b, "rmse")) ** 2
+
+
+def by_n_panels(col, models, ylabel, ylog=False, ref=None, ylim=None, data=None):
+    data = summ if data is None else data
+    fig, axes = plt.subplots(1, 4, figsize=(9, 3.3), sharey=True)
+    for ax, key in zip(axes, R.DGP_ORDER):
+        for m in models:
+            q = data[(data.model == m) & (data.dgp == key)].set_index("n").sort_index()
+            ax.plot(q.index, q[col], marker=STYLE[m]["marker"], color=STYLE[m]["color"], lw=1.6,
+                    ms=5, markeredgecolor="white", label=R.SHORT[m])
+        if ref is not None:
+            ax.axhline(ref, color="#52514e", lw=1, ls=":")
+        ax.set_xscale("log")
+        if ylog:
+            ax.set_yscale("log")
+        ax.set_xticks(SIZES)
+        ax.set_xticklabels(["100", "500", "1k", "5k"])
+        ax.minorticks_off()
+        ax.set_title(R.DGP_LABELS[key])
+        ax.set_xlabel("Sample size")
+        if ylim:
+            ax.set_ylim(*ylim)
+    axes[0].set_ylabel(ylabel)
+    h, l = axes[0].get_legend_handles_labels()
+    fig.legend(h, l, loc="lower center", ncol=len(models), frameon=False, fontsize=8)
+    fig.tight_layout(rect=(0, 0.07, 1, 1))
+    return fig
+```
+
+# Introduction
+
+Regression discontinuity designs (RDD) estimate the effect of a treatment that is assigned by a cutoff on a continuous score. Cases just above and just below the cutoff should be similar, so a jump in the outcome at the cutoff estimates the effect of the treatment [@thistlethwaite1960regression; @hahn2001identification]. Criminology has used the design since the early 1980s, to evaluate unemployment benefits for people released from prison [@berk1983capitalizing], prison security classification scores [@berk1999evaluation; @chen2007harsher], and the blood alcohol limits for drunk driving [@hansen2015punishment].
+
+The hard part of an RDD is estimating the outcome curve on each side of the cutoff. The current default is a kernel estimator. You fit a straight line to the cases within a bandwidth on each side of the cutoff, weight the cases closer to the cutoff more heavily, and pick the bandwidth with a formula that trades off bias against variance [@imbens2008regression; @imbens2012optimal]. @calonico2014robust added a bias correction and a confidence interval that accounts for it, and their rdrobust software does all of these steps [@calonico2017rdrobust]. Earlier work often fit a global polynomial to all of the data instead. @gelman2019high showed that high-order polynomials give noisy estimates, put large weights on cases far from the cutoff, and give confidence intervals that are too narrow, which pushed the field further toward local linear kernel estimators.
+
+I have been skeptical of the kernel estimators [@wheeler2021rdd]. They throw away most of the data, the estimates move around with small changes to the bandwidth, and the plots of the fitted lines often show odd artifacts near the cutoff. What I have used instead is a regression spline fit to all of the data, with knots so the curve can bend and a dummy variable for the jump at the cutoff. Splines are much better behaved than high-order polynomials, especially near the ends of the data [@harrell2015regression], so the problems Gelman and Imbens found with polynomials should not carry over. The spline model is also just a regression, so it is easy to add covariates or let the effect vary across groups.
+
+This paper tests that idea with a simulation. I compare the rdrobust kernel estimator to four spline models: the two I suggested in the blog post (knots on a regular grid that either skips or includes the cutoff), and two that let the shape of the curve change at the cutoff. I also ask two other questions. The first is whether out-of-sample prediction error, from leave-one-out or k-fold cross-validation, can tell an analyst which model to trust. The second is whether machine learning models (a random forest and XGBoost) can estimate the counterfactual for the treated cases, and whether conformal prediction intervals built from their out-of-sample errors cover the treatment effect. The simulations use four data generating processes, two with smooth curves and the two benchmark designs used to develop rdrobust [@calonico2014robust], with samples of 100 to 5,000 cases.
+
+The short answer is that the spline with a dummy variable is better when the treatment shifts the outcome curve without changing its shape, which is the assumption behind that model, and worse when the shape changes at the cutoff. When the curve has the same shape on both sides, the kernel estimator needs 1.6 to 2.2 times as much data to match the spline's accuracy, and with the knots fixed in advance the spline's intervals are 25% to 40% shorter with the right coverage. In the two benchmark designs, where the curve changes shape at the cutoff, the common spline is biased and its intervals cover the true effect as little as 60% of the time, while splines that let the shape change do about as well as the kernel estimator. Out-of-sample prediction error does not reliably pick the better model. The tree models are biased at the cutoff, and conformal intervals for the average effect only come close to their nominal coverage when they are built from errors that mimic extrapolating across the cutoff. In the drunk driving data from @hansen2015punishment, the kernel estimator cannot tell the effect of the 0.08 blood alcohol threshold on recidivism from zero with over 100,000 stops, while the splines and Hansen's own fixed-window regression can. But the common splines also reject too often at a placebo cutoff where the curve bends.
+
+# Estimators
+
+Throughout, $x$ is the running variable, the cutoff is $c$, and the treatment indicator is $D = 1(x \geq c)$. The target is the jump in the mean outcome at the cutoff, $\tau = \lim_{x \downarrow c} E[Y|x] - \lim_{x \uparrow c} E[Y|x]$.
+
+## Kernel estimator
+
+The kernel estimator is rdrobust with its defaults [@calonico2017rdrobust], using the Python version of the package. It fits a local linear regression on each side of the cutoff with triangular kernel weights, $w_i = 1 - |x_i - c|/h$ for cases within the bandwidth $h$ and zero otherwise. The bandwidth is the same on both sides and is chosen to minimize the mean squared error of the estimate [@calonico2020optimal]. The point estimate is the difference between the two intercepts at the cutoff. The confidence interval is the robust bias-corrected interval. It subtracts an estimate of the bias, taken from a local quadratic fit with a second and larger bandwidth, and widens the standard error to account for that step [@calonico2014robust; @calonico2018effect]. This is the interval the rdrobust authors recommend reporting.
+
+## Spline models
+
+The spline models are fit by ordinary least squares to all of the data. The basis is a natural cubic spline, also called a restricted cubic spline. It is a cubic polynomial between knots, joined smoothly at the knots, and constrained to be linear beyond the two outer knots [@durrleman1989flexible; @harrell2015regression]. The outer knots are the smallest and largest values of $x$, and the interior knots are on a regular grid with spacing $s$. I consider spacings of 1/2, 1/3, 1/4, 1/5, 1/6, 1/8, 1/10, and 1/12 of the range of $x$, and pick the spacing with the lowest leave-one-out mean squared error. For least squares the leave-one-out residual has a closed form, $e_i / (1 - h_{ii})$ with $h_{ii}$ the leverage, so the search costs almost nothing. Interior knots closer than $s/2$ to the outer knots are dropped.
+
+The four spline models differ in where the knots go and how much the curve may change at the cutoff. The first, *spline with the cutoff between knots*, is one spline over the whole range plus the dummy $D$. The knot grid is shifted so the cutoff falls halfway between two knots, at $c \pm s/2, c \pm 3s/2$, and so on, and the effect is the coefficient on $D$. This is the model in @wheeler2021rdd. The second, *spline with a knot at the cutoff*, is the same except the grid is $c, c \pm s, c \pm 2s, \ldots$, so one knot sits on the cutoff. The third adds $D(x - c)$ and $D(x - c)^2$ to the knot-at-cutoff model, so the slope and the curvature of the curve may change at the cutoff. The fourth fits a separate cubic B-spline to each side of the cutoff, with knots on the same grid. That is the spline version of fitting separate lines or polynomials on each side.
+
+The first two models assume the curve has the same shape on both sides of the cutoff, and the treatment shifts it up or down. That is a strong assumption. If the treatment effect varies with $x$, the two sides will have different slopes, and a common spline has to bend to fit both. The last two models relax the assumption. For the separate splines I do not use the natural spline basis. A natural spline has zero curvature at its outer knots, and with separate fits the outer knot on each side is the cutoff, which is exactly where the estimate is taken. In early runs that constraint biased the separate natural splines the same way a straight line is biased. A plain cubic B-spline has no constraint at the cutoff.
+
+Standard errors use the HC3 heteroskedasticity consistent estimator, and the 95% intervals use a $t$ distribution with $n - p$ degrees of freedom, where $p$ is the number of coefficients.
+
+## Tree models
+
+The random forest [@breiman2001random; @pedregosa2011scikit] and XGBoost [@chen2016xgboost] are fit separately to each side of the cutoff, what @kunzel2019metalearners call a T-learner. The effect is the treated model's prediction at the cutoff minus the control model's prediction at the cutoff. The random forest has 100 trees and picks its minimum leaf size (1%, 2.5%, 5%, or 10% of the cases on that side, and at least 3) by out-of-bag error. XGBoost uses trees of depth 2, a learning rate of 0.05, 80% subsampling, and a minimum child weight of 5, and picks the number of rounds (10 to 400) by 5-fold cross-validation. The only feature is $x$.
+
+Tree models predict a constant beyond their last split. So at the cutoff they average the outcomes of the nearest cases on each side, which is a kernel estimator that fits a flat line instead of a sloped one. That has a bias proportional to the slope of the curve at the cutoff [@imbens2008regression]. I include the tree models because the question of how to get a counterfactual out of a machine learning model comes up often, not because I expect them to do well.
+
+## Out-of-sample error
+
+Every model gets an out-of-sample prediction for every case. For the splines these are exact leave-one-out predictions from the hat matrix. The kernel estimator is two weighted least squares lines, so its leave-one-out predictions also have a closed form, but only for the cases within the bandwidth. The random forest uses out-of-bag predictions and XGBoost uses 5-fold cross-validation, since refitting them for every case would be too slow. To compare models, I take the mean squared out-of-sample error of the cases within the kernel estimator's bandwidth, weighted by the triangular kernel weights, so the cases closest to the cutoff count the most. This is meant to give the out-of-sample comparison its best shot at measuring fit near the cutoff. I report it divided by $\sigma^2$, so 1 is the error of a model that knows the true curve.
+
+## Conformal intervals for the counterfactual
+
+For the models whose control side is fit only to control cases (the separate splines, the random forest, and XGBoost), the control model's prediction for a treated case is a counterfactual, what that case's outcome would have been without treatment. For the $m$ treated cases within the bandwidth of the cutoff, the estimated individual effect is $e_i = y_i - \hat{f}_0(x_i)$.
+
+A conformal prediction interval puts a margin around a prediction equal to a quantile of the out-of-sample errors [@vovk2005algorithmic; @lei2018distribution]. Using leave-one-out errors gives the jackknife version [@barber2021predictive], and out-of-bag errors the jackknife+-after-bootstrap version [@kim2020predictive]. I build three intervals from the out-of-sample errors $r_j$ of the $n_0$ control cases. The *individual* interval is $e_i \pm q$, where $q$ is the $\lceil 0.95(n_0 + 1) \rceil$-th smallest $|r_j|$. This is a prediction interval for each treated case's own effect, in the spirit of @lei2021conformal. The *average* interval is $\bar{e} \pm q_m$, where $q_m$ is the same quantile taken over the absolute means of every run of $m$ consecutive control residuals, sorted by $x$. It treats the average of $m$ out-of-sample errors as the reference distribution for the average of the $m$ counterfactual errors.
+
+The standard out-of-sample errors are mostly interpolation errors, the model predicting a case with data on both sides of it. The counterfactual is an extrapolation across the cutoff. So the third interval, the *rolling origin* interval, refits the control model at 20 pseudo-cutoffs on the control side. Each time it uses only the control cases to the left of the pseudo-cutoff, keeps the tuning from the full fit, and predicts the control cases within $h$ to the right of the pseudo-cutoff. The pseudo-cutoffs run from $c - h$ down to the point that leaves at least 20 cases (or 25% of the control cases, whichever is more) to fit on. The interval is $\bar{e} \pm q_{ro}$, with $q_{ro}$ the conformal quantile of the 20 absolute block mean errors. This is the regression discontinuity version of the forward-forecast conformal intervals I used for synthetic control designs [@wheeler2026synthpower], and it is close to the one-sided cross-validation that @imbens2008regression suggested for choosing a bandwidth.
+
+Every treated case has the same effect in the simulations below, so an interval covers if it contains $\tau$.
+
+# Simulation design
+
+The outcome is $Y = \mu_0(X) + \tau D + \sigma \varepsilon$, with $\varepsilon$ standard normal and the cutoff at $c = 0$. @fig-dgp shows the four curves $\mu_0$, the mean outcome without treatment. In the *linear* design $X$ is uniform on $(-1, 1)$, $\mu_0(x) = x$, and $\sigma = 1$. The *smooth curve* design has the same $X$ and $\sigma$ and $\mu_0(x) = \tanh(3(x + 0.2))$, which bends sharply just to the left of the cutoff. The *Lee* design is the one @calonico2014robust built from the U.S. House election data in @lee2008randomized. There $X = 2B - 1$ with $B \sim \text{Beta}(2, 4)$, so only 19% of cases are treated, $\sigma = 0.1295$, and $\mu_0$ is a fifth order polynomial on each side. The *Ludwig-Miller* design is built the same way from the Head Start data in @ludwig2007does, with $\sigma = 0.6136$ as in the replication code for @calonico2020optimal.
+
+In the Lee and Ludwig-Miller designs the polynomials on the two sides are different curves. I subtract their jump at zero so that the no-effect world has none, but the two sides still have different slopes and curvatures at the cutoff (in Ludwig-Miller the slope is 2.3 on the left and 18.5 on the right). In the linear and smooth curve designs the curve is the same on both sides. These two pairs are the core of the comparison, since the common spline models assume the second pair away.
+
+```{python}
+#| label: fig-dgp
+#| fig-cap: "The four designs. Lines are the mean outcome with no treatment effect, points are one simulated sample of 500. The dotted vertical line is the cutoff. The Lee and Ludwig-Miller curves change shape at the cutoff."
+#| fig-width: 7.5
+#| fig-height: 5.5
+fig, axes = plt.subplots(2, 2, figsize=(7.5, 5.5))
+for ax, key in zip(axes.flat, R.DGP_ORDER):
+    g = DGPS[key]
+    rng = np.random.default_rng(10)
+    x, y, d = g.sample(500, rng)
+    ax.scatter(x, y, s=5, color="#8a8984", alpha=0.45, lw=0)
+    for side in (x < 0, x >= 0):
+        xs = np.sort(x[side])
+        ax.plot(xs, g.mu0(xs), color="#2a78d6", lw=2)
+    ax.axvline(0, color="#52514e", lw=1, ls=":")
+    ax.set_title(R.DGP_LABELS[key])
+    ax.set_xlabel("Running variable")
+axes[0, 0].set_ylabel("Outcome")
+axes[1, 0].set_ylabel("Outcome")
+fig.tight_layout()
+```
+
+I draw samples of 100, 500, 1,000, and 5,000 cases: `{python} com(REPS_FAST)` samples for each design and size for the kernel and spline models, and the first `{python} com(REPS_TREES)` of those same samples for the tree models, which are much slower to fit.
+
+Every sample is drawn with $\tau = 0$. All of the estimators are shift equivariant: adding $\tau D$ to the outcome moves the estimate and both ends of every interval by exactly $\tau$, and leaves the out-of-sample errors and the rdrobust bandwidth unchanged. The repository has tests that check this for every model. So one set of samples gives the results for every effect size. The interval for an effect of $\tau$ is the no-effect interval shifted by $\tau$, and the power for $\tau$ is the share of the shifted intervals that exclude zero. I average the power for $\tau$ and $-\tau$, so that a biased estimator does not get credit for being biased in the direction of the effect. Effects and errors are reported in units of $\sigma$.
+
+For each model I report the bias and root mean squared error (RMSE) of the estimate, the coverage of the 95% interval, its median length, and the minimum detectable effect (MDE), the smallest effect with 80% power.
+
+# Results
+
+## Accuracy of the estimates
+
+```{python}
+#| label: fig-rmse
+#| fig-cap: "Root mean squared error of the estimated effect, in units of sigma, by sample size. Both axes are on a log scale."
+#| fig-width: 9
+#| fig-height: 3.3
+by_n_panels("rmse", R.CI_MODELS, "RMSE (sigma units)", ylog=True)
+plt.show()
+```
+
+@fig-rmse shows the RMSE of each estimator. When the curve has the same shape on both sides of the cutoff, the common splines are the most accurate at every sample size. In the linear design with 1,000 cases, the spline with a knot at the cutoff has an RMSE of `{python} num(S('linear', 1000, 'spline_at', 'rmse'))` against `{python} num(S('linear', 1000, 'rdrobust', 'rmse'))` for the kernel estimator. RMSE shrinks with the square root of the sample size, so the kernel estimator needs about `{python} num(data_ratio('linear', 1000, 'rdrobust', 'spline_at'), 1)` times as many cases to match the spline. In the smooth curve design the ratio is `{python} num(data_ratio('curved', 1000, 'rdrobust', 'spline_at'), 1)`. The two splines that let the curve change shape at the cutoff pay for that flexibility in these designs. The spline with a slope and curvature change is about as accurate as the kernel estimator or a bit better, and the separate splines are a bit worse.
+
+With 100 cases the kernel estimator is erratic. In 2% of the samples in the smooth designs, and 6% in the Lee and Ludwig-Miller designs, its estimate is off by more than $3\sigma$. In those samples the bandwidth selector picks a bandwidth that leaves only a handful of cases on one side, and the two local lines go wherever those few cases point. In another `{python} pct(S('lee', 100, 'rdrobust', 'failed'))` (Lee) and `{python} pct(S('lm', 100, 'rdrobust', 'failed'))` (Ludwig-Miller) of samples rdrobust returns no estimate at all, because too few treated cases fall inside the bandwidth. That is why its RMSE at 100 cases is off the scale of the other models. Its intervals are also very wide in those samples, so its coverage holds up. The median absolute error, which ignores the blowups, still favors the common splines at 100 cases (`{python} num(S('linear', 100, 'spline_at', 'mae'))` against `{python} num(S('linear', 100, 'rdrobust', 'mae'))` in the linear design).
+
+In the Lee and Ludwig-Miller designs the picture changes. From 500 cases on, the five estimators have RMSEs within about 25% of each other, and no one model is best across sizes and designs. But the errors come from different places. The common splines are biased. With 1,000 cases, the bias of the spline with a knot at the cutoff is `{python} num(S('lee', 1000, 'spline_at', 'bias'))` in the Lee design and `{python} num(S('lm', 1000, 'spline_at', 'bias'))` in Ludwig-Miller, against `{python} num(S('lee', 1000, 'rdrobust', 'bias'))` and `{python} num(S('lm', 1000, 'rdrobust', 'bias'))` for the kernel estimator. Neither goes away with more data. The knot spacing is chosen to fit the whole curve, and the kink at the cutoff is a small part of that fit. The kernel bandwidth is chosen to balance bias against variance, so some bias is there by design. With 5,000 cases the separate splines and the spline with a slope and curvature change have the smallest bias in both designs.
+
+## Coverage
+
+```{python}
+#| label: fig-coverage
+#| fig-cap: "Coverage of the 95% intervals by sample size. The dotted line is 95%."
+#| fig-width: 9
+#| fig-height: 3.3
+by_n_panels("coverage", R.CI_MODELS, "Coverage of 95% interval", ref=0.95, ylim=(0.5, 1.0))
+plt.show()
+```
+
+@fig-coverage shows the coverage of the 95% intervals. The kernel estimator's robust bias-corrected interval covers 91% to 94% of the time in the linear, smooth curve, and Ludwig-Miller designs. In the Lee design its coverage falls as the sample grows, to `{python} pct(S('lee', 5000, 'rdrobust', 'coverage'))` with 5,000 cases, so even the bias-corrected interval does not fully correct for the bias in that design. The common splines cover 86% to 93% of the time in the smooth designs, and 90% to 93% from 1,000 cases on, a little below the nominal rate. That shortfall comes from picking the knot spacing by leave-one-out error, which I return to below. In the Lee and Ludwig-Miller designs the common spline intervals are much too narrow for their bias. With 5,000 cases the spline with a knot at the cutoff covers `{python} pct(S('lee', 5000, 'spline_at', 'coverage'))` of the time in Lee and `{python} pct(S('lm', 5000, 'spline_at', 'coverage'))` in Ludwig-Miller. Putting the cutoff halfway between two knots helps in Lee, but only gets coverage to `{python} pct(S('lee', 5000, 'spline_mid', 'coverage'))`. The spline with a slope and curvature change and the separate splines cover 83% to 93% of the time in those designs.
+
+## Interval length and power
+
+```{python}
+#| label: tbl-main
+#| output: asis
+rows = []
+for key in R.DGP_ORDER:
+    for m in R.CI_MODELS:
+        rows.append({"Design": R.DGP_LABELS[key], "Model": R.LABELS[m],
+                     "Bias": num(S(key, 1000, m, "bias")), "RMSE": num(S(key, 1000, m, "rmse")),
+                     "Coverage": pct(S(key, 1000, m, "coverage")),
+                     "Length": num(S(key, 1000, m, "length")),
+                     "False positive": pct(S(key, 1000, m, "size")),
+                     "MDE": num(S(key, 1000, m, "mde80"))})
+print(pd.DataFrame(rows).to_markdown(index=False, disable_numparse=True))
+print()
+print(f": Results with 1,000 cases. Bias, RMSE, the median interval length, and the minimum detectable effect (MDE, the smallest effect with 80% power) are in units of sigma. False positive is the share of intervals that exclude zero when there is no effect. {com(REPS_FAST)} samples per design. Appendix A has every sample size.")
+```
+
+```{python}
+#| label: fig-power
+#| fig-cap: "Power by effect size with 1,000 cases, averaged over positive and negative effects. The value at an effect of zero is the false positive rate."
+#| fig-width: 9
+#| fig-height: 3.3
+taus = np.linspace(0, 1.5, 61)
+fig, axes = plt.subplots(1, 4, figsize=(9, 3.3), sharey=True)
+for ax, key in zip(axes, R.DGP_ORDER):
+    for m in R.CI_MODELS:
+        g = df[(df.model == m) & (df.dgp == key) & (df.n == 1000)]
+        ax.plot(taus, R.power_curve(g.lo / g.sigma, g.hi / g.sigma, taus),
+                color=STYLE[m]["color"], lw=1.8, label=R.SHORT[m])
+    ax.axhline(0.8, color="#52514e", lw=1, ls=":")
+    ax.set_title(R.DGP_LABELS[key])
+    ax.set_xlabel("Effect (sigma units)")
+axes[0].set_ylabel("Power")
+h, l = axes[0].get_legend_handles_labels()
+fig.legend(h, l, loc="lower center", ncol=5, frameon=False, fontsize=8)
+fig.tight_layout(rect=(0, 0.07, 1, 1))
+plt.show()
+```
+
+@tbl-main gives the full set of results with 1,000 cases, and @fig-power the power curves. The spline intervals are much shorter than the kernel intervals. In the linear design the interval for the spline with a knot at the cutoff is `{python} num(S('linear', 1000, 'spline_at', 'length'))` wide against `{python} num(S('linear', 1000, 'rdrobust', 'length'))` for the kernel estimator, and the spline can detect an effect of `{python} num(S('linear', 1000, 'spline_at', 'mde80'))` with 80% power against `{python} num(S('linear', 1000, 'rdrobust', 'mde80'))` for the kernel. That overstates the spline's advantage somewhat, because the spline intervals are a little too narrow (they cover `{python} pct(S('linear', 1000, 'spline_at', 'coverage'))` of the time). The next section shows that with a fixed knot spacing the spline intervals have the right coverage and are still much shorter than the kernel intervals. The same holds in the smooth curve design.
+
+In the Lee design the spline with a knot at the cutoff has a false positive rate of `{python} pct(S('lee', 1000, 'spline_at', 'size'))`. Its power curve in @fig-power starts at 40% and is the highest curve for small effects, but that is its bias, not power. The kernel estimator, the spline with a slope and curvature change, and the separate splines have similar minimum detectable effects in the Lee and Ludwig-Miller designs, about 0.85 to 1.0$\sigma$ with 1,000 cases, though the two splines have higher false positive rates in the Lee design (12% to 15%, against 9% for the kernel).
+
+## Fixed versus data-driven knot spacing
+
+```{python}
+#| label: tbl-knots
+#| output: asis
+RULES = {"loo": "Leave-one-out", "fixed_4": "Fixed, 1/4 of range", "fixed_6": "Fixed, 1/6 of range"}
+rows = []
+for key in R.DGP_ORDER:
+    for m in ["spline_mid", "spline_at"]:
+        for rule, lab in RULES.items():
+            rows.append({"Design": R.DGP_LABELS[key], "Model": R.SHORT[m], "Knot spacing": lab,
+                         "Bias": num(FK(key, 1000, m, rule, "bias")), "RMSE": num(FK(key, 1000, m, rule, "rmse")),
+                         "Coverage": pct(FK(key, 1000, m, rule, "coverage")),
+                         "Length": num(FK(key, 1000, m, rule, "length")),
+                         "MDE": num(FK(key, 1000, m, rule, "mde80"))})
+print(pd.DataFrame(rows).to_markdown(index=False, disable_numparse=True))
+print()
+print(f": The two common splines with the knot spacing chosen by leave-one-out error or fixed in advance, 1,000 cases, {com(fk.reps.min())} samples (the first {com(fk.reps.min())} of the main samples). In units of sigma.")
+```
+
+@tbl-knots compares the leave-one-out choice of knot spacing to two spacings fixed in advance, a quarter and a sixth of the range of $x$ (3 and 5 interior knots), on the first `{python} com(fk.reps.min())` samples. In the smooth designs the fixed spacings give intervals with the right coverage, 95% for the spline with a knot at the cutoff with 1,000 cases with either spacing, and about the same RMSE as the leave-one-out choice. The leave-one-out choice makes the intervals too narrow. It picks the spacing that happens to fit the noise in each sample best, and the interval does not account for that choice. With a fixed spacing of a quarter of the range, the spline with a knot at the cutoff has intervals `{python} pct(1 - FK('linear', 1000, 'spline_at', 'fixed_4', 'length') / S('linear', 1000, 'rdrobust', 'length'))` shorter than the kernel estimator's in the linear design and `{python} pct(1 - FK('curved', 1000, 'spline_at', 'fixed_4', 'length') / S('curved', 1000, 'rdrobust', 'length'))` shorter in the smooth curve design, with the same coverage, and a minimum detectable effect of `{python} num(FK('linear', 1000, 'spline_at', 'fixed_4', 'mde80'))` against `{python} num(S('linear', 1000, 'rdrobust', 'mde80'))` for the kernel estimator. One caution is that a fixed number of knots can be too few for a large sample. With 3 knots and the cutoff between knots, the spline is too stiff for the smooth curve design with 5,000 cases, and its coverage falls to `{python} pct(FK('curved', 5000, 'spline_mid', 'fixed_4', 'coverage'))`.
+
+In the Lee and Ludwig-Miller designs fixed knots make the common splines worse, not better. The leave-one-out choice at least adds knots as the sample grows, which shrinks the bias from the shape change. With 5,000 cases the fixed spacings have biases from `{python} num(min(FK(k, 5000, m, r, 'bias') for k in ['lee', 'lm'] for m in ['spline_at', 'spline_mid'] for r in ['fixed_4', 'fixed_6']), 1)` to `{python} num(max(FK(k, 5000, m, r, 'bias') for k in ['lee', 'lm'] for m in ['spline_at', 'spline_mid'] for r in ['fixed_4', 'fixed_6']), 1)`$\sigma$, and all but one have coverage below 20%. The bias also depends on where the knots happen to fall relative to the kink. In the Lee design with 1,000 cases, the spline with a knot at the cutoff has a bias of `{python} num(FK('lee', 1000, 'spline_at', 'fixed_4', 'bias'))` with a spacing of a quarter of the range and `{python} num(FK('lee', 1000, 'spline_at', 'fixed_6', 'bias'))` with a sixth. Nothing in the data tells you which spacing will be the lucky one.
+
+## Does out-of-sample error pick the right model?
+
+```{python}
+#| label: tbl-oos
+#| output: asis
+sel = R.selection(df, R.CI_MODELS)
+rows = []
+for key in R.DGP_ORDER:
+    sk = sel[(sel.dgp == key) & (sel.n == 1000)]
+    for m in R.CI_MODELS:
+        rows.append({"Design": R.DGP_LABELS[key], "Model": R.LABELS[m],
+                     "Excess error": num((S(key, 1000, m, "oos") - 1) * 100),
+                     "RMSE": num(S(key, 1000, m, "rmse")),
+                     "Coverage": pct(S(key, 1000, m, "coverage")),
+                     "Chosen": pct((sk.chosen == m).mean())})
+    rows.append({"Design": R.DGP_LABELS[key], "Model": "*Lowest out-of-sample error*",
+                 "Excess error": "", "RMSE": num(np.sqrt(np.mean(sk.err ** 2))),
+                 "Coverage": pct(sk.cover.mean()), "Chosen": ""})
+print(pd.DataFrame(rows).to_markdown(index=False, disable_numparse=True))
+print()
+print(": Out-of-sample error and accuracy with 1,000 cases. Excess error is the kernel weighted out-of-sample mean squared error within the bandwidth, minus sigma squared, as a percent of sigma squared. Chosen is the share of samples in which the model had the lowest out-of-sample error. The last row in each design is the estimate from whichever model had the lowest error in each sample.")
+```
+
+If out-of-sample error is going to justify one model over another, the model with the lowest error should be the one with the most accurate estimate of the effect. @tbl-oos shows how that works out with 1,000 cases. The first thing to notice is how small the differences are. The out-of-sample error of every model is within a few percent of $\sigma^2$, the error you would get if you knew the true curve. Most of the prediction error is noise that no model can remove, and the error of the fitted curve right at the cutoff, which is what the effect estimate depends on, is a small part of the average over all the cases in the bandwidth.
+
+Averaged over samples, out-of-sample error ranks the models sensibly in three of the four designs. In the smooth designs the common splines have the lowest error and the lowest RMSE. In the Ludwig-Miller design the ranking by out-of-sample error is the same as the ranking by RMSE: the separate splines first, then the spline with a slope and curvature change, the kernel, and the two common splines. The shape change at the cutoff in that design is large enough to show up in the prediction errors. The Lee design is where it fails. Out-of-sample error ranks the spline with the cutoff between knots first and the kernel estimator last, while the kernel estimator has the lowest RMSE and the common splines are the most biased. The shape change in the Lee design is too subtle to move the prediction error, but not too subtle to bias the effect.
+
+Within a single sample, which is the situation an analyst is in, the choice is much noisier. The model with the lowest out-of-sample error is the most accurate model in that sample only `{python} pct(R.selection_summary(df, R.CI_MODELS).query('n == 1000').agree.min())` to `{python} pct(R.selection_summary(df, R.CI_MODELS).query('n == 1000').agree.max())` of the time with 1,000 cases, about what you would get by picking one of the five at random. Using whichever model has the lowest error gives an RMSE about the same as always using the kernel estimator, and worse than always using the best model for that design. The intervals of the chosen model cover the true effect `{python} pct(R.selection_summary(df, R.CI_MODELS).query('n == 1000').coverage.min())` to `{python} pct(R.selection_summary(df, R.CI_MODELS).query('n == 1000').coverage.max())` of the time. In the Lee design that is because the chosen model is usually a biased common spline. In the other designs it is because a model that happens to fit the noise in a sample well also gets a narrower interval in that sample. The same pattern holds at the other sample sizes (Appendix A).
+
+## Tree models
+
+```{python}
+#| label: fig-trees
+#| fig-cap: "Bias (top) and RMSE (bottom, log scale) of the random forest and XGBoost, with the kernel estimator and the spline with a knot at the cutoff for reference. In units of sigma."
+#| fig-width: 9
+#| fig-height: 5.6
+TM = ["rdrobust", "spline_at", "rf", "xgb"]
+fig, axes = plt.subplots(2, 4, figsize=(9, 5.6), sharex=True)
+for j, key in enumerate(R.DGP_ORDER):
+    for i, col in enumerate(["bias", "rmse"]):
+        ax = axes[i, j]
+        for m in TM:
+            q = summ[(summ.model == m) & (summ.dgp == key)].set_index("n").sort_index()
+            ax.plot(q.index, q[col], marker=STYLE[m]["marker"], color=STYLE[m]["color"], lw=1.6,
+                    ms=5, markeredgecolor="white", label=R.SHORT[m])
+        ax.set_xscale("log")
+        if col == "rmse":
+            ax.set_yscale("log")
+            ax.set_xlabel("Sample size")
+        else:
+            ax.axhline(0, color="#52514e", lw=1, ls=":")
+            ax.set_title(R.DGP_LABELS[key])
+        ax.set_xticks(SIZES)
+        ax.set_xticklabels(["100", "500", "1k", "5k"])
+        ax.minorticks_off()
+axes[0, 0].set_ylabel("Bias (sigma units)")
+axes[1, 0].set_ylabel("RMSE (sigma units)")
+h, l = axes[0, 0].get_legend_handles_labels()
+fig.legend(h, l, loc="lower center", ncol=4, frameon=False, fontsize=8)
+fig.tight_layout(rect=(0, 0.05, 1, 1))
+plt.show()
+```
+
+@fig-trees shows the random forest and XGBoost. Both are biased in every design, and the bias shrinks slowly as the sample grows. In the linear design with 1,000 cases the random forest's bias is `{python} num(S('linear', 1000, 'rf', 'bias'))`, roughly the slope of the curve times the distance from the cutoff to the cases in the last leaf on each side. In the Ludwig-Miller design, where the slope on the treated side is 18.5, the bias of the random forest is `{python} num(S('lm', 1000, 'rf', 'bias'))` with 1,000 cases and still `{python} num(S('lm', 5000, 'rf', 'bias'))` with 5,000. The random forest beats the kernel estimator in RMSE only where the kernel estimator is noisiest, in the linear design up to 1,000 cases and the smooth curve design at 100 cases. Otherwise the tree models are the least accurate of all the estimators, and they come with no interval for the effect at the cutoff. This is not a matter of tuning. A tree predicts a constant past its last split, so at a boundary it is a local average, and a local average is biased wherever the curve has a slope. Tree models are good at finding structure in many variables; with one running variable and a boundary, a regression line does the job better.
+
+## Conformal intervals for the counterfactual
+
+```{python}
+#| label: tbl-conformal
+#| output: asis
+rows = []
+for key in R.DGP_ORDER:
+    for m in ["spline_sep", "rf", "xgb"]:
+        rows.append({"Design": R.DGP_LABELS[key], "Model": R.SHORT[m],
+                     "Individual coverage": pct(C(key, 1000, m, "ind_cov")),
+                     "Individual length": num(C(key, 1000, m, "ind_len"), 1),
+                     "Average coverage": pct(C(key, 1000, m, "avg_cov")),
+                     "Rolling coverage": pct(C(key, 1000, m, "avgro_cov")),
+                     "Rolling length": num(C(key, 1000, m, "avgro_len")),
+                     "Individual power, 2 sigma": pct(C(key, 1000, m, "ind_rej_2"))})
+print(pd.DataFrame(rows).to_markdown(index=False, disable_numparse=True))
+print()
+print(f": Conformal intervals for the counterfactual with 1,000 cases, {com(REPS_TREES)} samples. Individual intervals are for each treated case within the bandwidth; their coverage is averaged over cases. Average intervals are for the mean effect over those cases, built from the usual out-of-sample errors (average) or from rolling origin errors (rolling). Lengths are in units of sigma. Individual power is the share of individual intervals that exclude zero when every treated case has an effect of 2 sigma. Appendix B has every sample size.")
+```
+
+@tbl-conformal shows the conformal intervals for the counterfactual with 1,000 cases. The individual intervals for the tree models cover the true effect `{python} pct(min(C(k, 1000, m, 'ind_cov') for k in ['linear', 'curved'] for m in ['rf', 'xgb']))` to `{python} pct(max(C(k, 1000, m, 'ind_cov') for k in ['linear', 'curved'] for m in ['rf', 'xgb']))` of the time in the linear and smooth curve designs, and a bit less in the Lee design. But they are about $4\sigma$ long. They are prediction intervals for one case's outcome, so they carry all of that case's noise. Even when every treated case has an effect of $2\sigma$, far larger than most effects in criminology, only about 60% of the individual intervals exclude zero in the linear design. As a way to test whether a treatment had an effect, they are close to useless.
+
+The average intervals built from the usual out-of-sample errors are much shorter, and they almost never cover the true effect: at most `{python} pct(max(C(k, 1000, m, 'avg_cov') for k in R.DGP_ORDER for m in ['rf', 'xgb']))` of the time for the tree models with 1,000 cases. The out-of-sample errors of the control cases measure how well the model interpolates, predicting a case with data on both sides of it. The counterfactual for the treated cases is an extrapolation past the last control case. For the tree models that extrapolation is a flat line, so the counterfactual is off by the slope of the curve times the distance from the cutoff. Averaging over cases removes the noise but not that error, and the average of the usual out-of-sample errors has no way to know about it.
+
+The rolling origin intervals, which measure the error of the same kind of extrapolation on the control side, fix most of that in the designs where the curve is smooth through the cutoff. With 1,000 cases the tree models' rolling intervals cover `{python} pct(min(C(k, 1000, m, 'avgro_cov') for k in ['linear', 'curved'] for m in ['rf', 'xgb']))` to `{python} pct(max(C(k, 1000, m, 'avgro_cov') for k in ['linear', 'curved'] for m in ['rf', 'xgb']))` of the time in the linear and smooth curve designs, and 94% to 99% with 5,000 cases (Appendix B). The Ludwig-Miller design shows the limit of the idea. The rolling origin errors are all computed on the control side, where the curve has a slope of 2.3, and the treated cases' counterfactual follows a curve with a slope of 18.5. No amount of validation on the control side can see that, and the intervals never cover. It is the same problem the common spline has: any method that uses the shape of the curve on one side to predict the other assumes the shape does not change at the cutoff.
+
+So conformal intervals can be made to work for the counterfactual, but only with out-of-sample errors that mimic the extrapolation, and only under the same no-shape-change assumption as the common spline. Even then, the effect they cover is the average over the treated cases within the bandwidth, not the effect at the cutoff, and the tree models' bias makes them a poor choice for the counterfactual in the first place. The separate splines, whose counterfactual continues the control side curve past the cutoff as a straight line, do not do better here. Their slope at the end of the control data is noisy, so a straight line extended a bandwidth past the cutoff adds error the leave-one-out residuals do not see. Their individual intervals cover only `{python} pct(C('linear', 100, 'spline_sep', 'ind_cov'))` of the time with 100 cases in the linear design (`{python} pct(C('linear', 5000, 'spline_sep', 'ind_cov'))` with 5,000), and their rolling origin intervals cover but are `{python} num(C('linear', 1000, 'spline_sep', 'avgro_len'), 1)`$\sigma$ long with 1,000 cases, several times the kernel estimator's interval for the effect at the cutoff.
+
+# Application
+
+```{python}
+#| label: hansen-setup
+hf = pd.read_csv("results/hansen_full.csv")
+hc = pd.read_csv("results/hansen_curves.csv")
+hb = pd.read_csv("results/hansen_bins.csv")
+hs = pd.read_csv("results/hansen_subsamples.csv")
+HMODELS = ["hansen", "rdrobust", "spline_mid", "spline_at", "spline_kink", "spline_sep"]
+HLAB = dict(R.LABELS, hansen="Hansen (local linear, h = 0.05)",
+            spline_at_covs="Spline, knot at cutoff, with covariates")
+HSHORT = dict(R.SHORT, hansen="Hansen")
+pp = lambda v, d=1: "--" if pd.isna(v) else f"{round(v * 100, d) + 0.0:.{d}f}"
+
+
+def HF(c, model, col, kind="real"):
+    q = hf[(hf.cutoff == c) & (hf.model == model) & (hf.kind == kind)]
+    return q.iloc[0][col] if len(q) else np.nan
+
+
+# subsample summaries; each estimator is scored against its own full-data estimate
+hs["target"] = [HF(c, m, "est", k) if k == "real" else 0.0
+                for c, m, k in zip(hs.cutoff, hs.model, hs.kind)]
+hs["cover"] = (hs.lo <= hs.target) & (hs.hi >= hs.target)
+hs["sig"] = (hs.hi < 0) | (hs.lo > 0)
+hs["sig_neg"] = hs.hi < 0
+hs["len"] = hs.hi - hs.lo
+hsum = hs.groupby(["kind", "cutoff", "n", "model"]).agg(
+    reps=("est", "size"), sd=("est", "std"), rmse=("est", lambda v: np.nan),
+    length=("len", "median"), coverage=("cover", "mean"), sig=("sig", "mean"),
+    sig_neg=("sig_neg", "mean"), failed=("est", lambda v: v.isna().mean())).reset_index()
+hsum["rmse"] = [np.sqrt(np.mean((g.est - g.target) ** 2)) for _, g in hs.groupby(["kind", "cutoff", "n", "model"])]
+
+
+def HS(c, n, model, col, kind="real"):
+    q = hsum[(hsum.cutoff == c) & (hsum.n == n) & (hsum.model == model) & (hsum.kind == kind)]
+    return q.iloc[0][col] if len(q) else np.nan
+```
+
+The application is the blood alcohol thresholds for drunk driving in Washington State studied by @hansen2015punishment. A driver stopped with a blood alcohol content (BAC) of 0.08 or more is guilty of driving under the influence (DUI), and with 0.15 or more of an aggravated DUI, with stiffer penalties at each threshold. Hansen found that crossing the 0.08 threshold reduced the chance of another DUI stop within four years by about 2 percentage points, and crossing 0.15 by about 1 more. The data are the version distributed with @cunningham2021causal, `{python} com(len(pd.read_stata('data/hansen_dwi.dta')))` stops from 1999 to 2007. As in Hansen, the running variable is the lower of the two breath tests, since the lower test determines guilt, and the outcome is any new DUI stop within four years. For the 0.08 threshold I use the stops with a BAC from 0.03 up to 0.15, and for the 0.15 threshold the stops from 0.08 up to 0.25, so each analysis contains one threshold. That is `{python} com(HF(0.08, 'rdrobust', 'n'))` and `{python} com(HF(0.15, 'rdrobust', 'n'))` stops.
+
+BAC is recorded to the thousandth, so the running variable takes about a hundred distinct values in each window. That is not the continuous running variable of the simulations. rdrobust adjusts for the repeated values [@calonico2017rdrobust], and the splines treat BAC as a number like any other, but inference with a discrete running variable has its own problems [@kolesar2018inference].
+
+@fig-hansen shows the data with three of the fits, and @tbl-hansen gives the estimates from every model using all of the stops in each window. Hansen's own specification, a local linear fit with a rectangular kernel and a bandwidth of 0.05, gives an effect of `{python} pp(HF(0.08, 'hansen', 'est'))` percentage points at the 0.08 threshold, close to the 2 points in his paper (the public file has fewer stops than his full sample). The two common splines give `{python} pp(HF(0.08, 'spline_at', 'est'))` and `{python} pp(HF(0.08, 'spline_mid', 'est'))` points, with intervals that exclude zero. rdrobust gives `{python} pp(HF(0.08, 'rdrobust', 'est'))` points, but it picks a bandwidth of `{python} num(HF(0.08, 'rdrobust', 'h'), 3)`, about a dozen BAC values on each side of the threshold, and its robust interval runs from `{python} pp(HF(0.08, 'rdrobust', 'lo'))` to `{python} pp(HF(0.08, 'rdrobust', 'hi'))`. With over 100,000 stops, the kernel estimator cannot tell this effect from zero. The same happens at the 0.15 threshold, where the common splines and Hansen's model give about `{python} pp(HF(0.15, 'spline_at', 'est'))` points with intervals that exclude zero and rdrobust's interval includes zero.
+
+The models that let the shape change at the threshold do not agree as well. At 0.08 the separate splines give `{python} pp(HF(0.08, 'spline_sep', 'est'))` points with an interval that includes zero, and at 0.15 the spline with a slope and curvature change gives `{python} pp(HF(0.15, 'spline_kink', 'est'))`. Adding the driver's sex, race, age, and whether there was an accident to the spline with a knot at the cutoff barely moves its estimate, which is what you would expect if which side of the threshold a driver lands on is as good as random. The random forest and XGBoost disagree with each other about as much as with everything else, `{python} pp(HF(0.08, 'rf', 'est'))` and `{python} pp(HF(0.08, 'xgb', 'est'))` points at 0.08. The out-of-sample errors of all of the models are the same to three significant digits, so they say nothing about which one to believe.
+
+```{python}
+#| label: fig-hansen
+#| fig-cap: "Recidivism by blood alcohol content around the DUI (0.08) and aggravated DUI (0.15) thresholds. Points are the mean for each BAC value, sized by the number of stops. Lines are the common spline with a knot at the cutoff, the separate splines on each side, and the rdrobust local lines within their bandwidth."
+#| fig-width: 9
+#| fig-height: 3.8
+fig, axes = plt.subplots(1, 2, figsize=(9, 3.8))
+for ax, c in zip(axes, [0.08, 0.15]):
+    b = hb[hb.cutoff == c]
+    ax.scatter(b.x + c, b["mean"], s=b["size"] / b["size"].max() * 30, color="#8a8984", alpha=0.6, lw=0)
+    cur = hc[hc.cutoff == c]
+    for m, lab in [("spline_at", R.SHORT["spline_at"]), ("spline_sep", R.SHORT["spline_sep"]),
+                   ("rdrobust", R.SHORT["rdrobust"])]:
+        for side in (0, 1):
+            q = cur[(cur.d == side)]
+            ax.plot(q.x + c, q[m], color=STYLE[m]["color"], lw=2 if m == "rdrobust" else 1.6,
+                    label=lab if side == 0 else None)
+    ax.axvline(c, color="#52514e", lw=1, ls=":")
+    ax.set_title("DUI threshold (0.08)" if c == 0.08 else "Aggravated DUI threshold (0.15)")
+    ax.set_xlabel("Blood alcohol content (lower of two tests)")
+axes[0].set_ylabel("Share with a new DUI stop in 4 years")
+h, l = axes[0].get_legend_handles_labels()
+fig.legend(h, l, loc="lower center", ncol=3, frameon=False, fontsize=8)
+fig.tight_layout(rect=(0, 0.07, 1, 1))
+plt.show()
+```
+
+```{python}
+#| label: tbl-hansen
+#| output: asis
+rows = []
+for c in [0.08, 0.15]:
+    for m in HMODELS + ["spline_at_covs", "rf", "xgb"]:
+        est, lo, hi = HF(c, m, "est"), HF(c, m, "lo"), HF(c, m, "hi")
+        ex = HF(c, m, "oos_w")
+        rows.append({"Threshold": f"{c:.2f}", "Model": HLAB[m], "Estimate": pp(est),
+                     "95% interval": "--" if pd.isna(lo) else f"[{pp(lo)}, {pp(hi)}]",
+                     "Out-of-sample error": "--" if pd.isna(ex) else f"{ex:.5f}"})
+print(pd.DataFrame(rows).to_markdown(index=False, disable_numparse=True))
+print()
+print(": Estimated effect of crossing each threshold on recidivism, in percentage points, using every stop in the window. Out-of-sample error is the triangular kernel weighted leave-one-out (out-of-bag for the random forest, 5-fold for XGBoost) mean squared error within the rdrobust bandwidth. The tree models have no interval.")
+```
+
+To see how the estimators behave with less data, I drew `{python} com(hsum[hsum.kind == 'real'].reps.max())` random subsamples of 5,000, 10,000, and 25,000 stops from each window and refit every model. The true effect is unknown, so I score each model against its own estimate from all of the stops. @tbl-hansen-sub shows the results. Every model's intervals cover its full-data estimate `{python} pct(hsum[hsum.kind == 'real'].coverage.min())` to `{python} pct(hsum[hsum.kind == 'real'].coverage.max())` of the time, so the differences are in precision. At the 0.08 threshold with 10,000 stops, the kernel estimates are `{python} num(HS(0.08, 10000, 'rdrobust', 'sd') / HS(0.08, 10000, 'spline_at', 'sd'), 1)` times as variable as the estimates from the spline with a knot at the cutoff, and the kernel intervals are `{python} num(HS(0.08, 10000, 'rdrobust', 'length') / HS(0.08, 10000, 'spline_at', 'length'), 1)` times as long. With 25,000 stops the common splines put the whole interval below zero `{python} pct(HS(0.08, 25000, 'spline_mid', 'sig_neg'))` to `{python} pct(HS(0.08, 25000, 'spline_at', 'sig_neg'))` of the time, and the kernel estimator `{python} pct(HS(0.08, 25000, 'rdrobust', 'sig_neg'))` of the time. Hansen's specification does best of all, `{python} pct(HS(0.08, 25000, 'hansen', 'sig_neg'))`. It is also just a regression: ordinary least squares with a dummy and separate slopes on each side, on a window fixed in advance. The effect at the 0.15 threshold is smaller, and no model detects it more than `{python} pct(hsum[(hsum.kind == 'real') & (hsum.cutoff == 0.15)].sig_neg.max())` of the time in these subsamples.
+
+```{python}
+#| label: tbl-hansen-sub
+#| output: asis
+rows = []
+for c in [0.08, 0.15]:
+    for n in [5000, 10000, 25000]:
+        for m in HMODELS:
+            rows.append({"Threshold": f"{c:.2f}", "n": com(n), "Model": HSHORT[m],
+                         "SD": pp(HS(c, n, m, "sd"), 2), "Length": pp(HS(c, n, m, "length"), 1),
+                         "Covers full": pct(HS(c, n, m, "coverage")),
+                         "Significant": pct(HS(c, n, m, "sig_neg"))})
+print(pd.DataFrame(rows).to_markdown(index=False, disable_numparse=True))
+print()
+print(f": Random subsamples of the stops in each window, {com(hsum.reps.max())} at each size. SD is the standard deviation of the estimates and Length the median length of the 95% interval, in percentage points. Covers full is the share of intervals that contain that model's estimate from all of the stops. Significant is the share of intervals entirely below zero.")
+```
+
+```{python}
+#| label: tbl-hansen-placebo
+#| output: asis
+rows = []
+for c in sorted(hs[hs.kind == "placebo"].cutoff.unique()):
+    row = {"Placebo cutoff": f"{c:.3f}"}
+    for m in HMODELS:
+        row[HSHORT[m]] = pct(HS(c, 10000, m, "sig", kind="placebo"))
+    rows.append(row)
+print(pd.DataFrame(rows).to_markdown(index=False, disable_numparse=True))
+print()
+print(f": False positive rates at placebo cutoffs where the law does not change: the share of {com(hsum[hsum.kind == 'placebo'].reps.max())} random subsamples of 10,000 stops in which the 95% interval excludes zero. Each placebo cutoff uses the stops between the real thresholds on either side of it (0.03 to 0.08, 0.08 to 0.15, and 0.15 to 0.25).")
+```
+
+@tbl-hansen-placebo gives the false positive rates at three placebo cutoffs where the law does not change, using subsamples of 10,000 stops. At 0.115 and 0.20 every model rejects `{python} pct(hsum[(hsum.kind == 'placebo') & (hsum.cutoff > 0.1)].sig.min())` to `{python} pct(hsum[(hsum.kind == 'placebo') & (hsum.cutoff > 0.1)].sig.max())` of the time. At 0.05 the common splines reject `{python} pct(HS(0.05, 10000, 'spline_at', 'sig', 'placebo'))` of the time and Hansen's specification `{python} pct(HS(0.05, 10000, 'hansen', 'sig', 'placebo'))`, against `{python} pct(HS(0.05, 10000, 'rdrobust', 'sig', 'placebo'))` for the kernel estimator. That is not quite a false positive in the usual sense. In @fig-hansen, recidivism rises from about 9% at a BAC of 0.03 to about 13.5% around 0.045 and then levels off near 12%, and few drivers are stopped with a BAC that low, so a cutoff at 0.05 sits right where the curve bends. Every model except the separate splines puts an average drop of 2.3 to 2.7 points at 0.05. The common splines and Hansen's wide window, which assume the curve keeps its shape through the cutoff, take the bend for a jump and have intervals short enough to call it significant. The kernel interval is too wide to call anything. It is a small real-data version of the Lee and Ludwig-Miller results.
+
+# Discussion
+
+I went into this expecting to show that kernel estimators for RDD are junk. That is not what the simulations show. What they show is a trade-off, and which side of it you are on depends on an assumption you cannot check very well with the data.
+
+If the outcome curve has the same shape on both sides of the cutoff, so the treatment just shifts it up or down, a regression spline with a dummy variable at the cutoff is much better than the kernel estimator. The kernel estimator needs 1.6 to 2.2 times as much data to match its accuracy. With the knot spacing fixed in advance, the spline's intervals have the right coverage and are 25% to 40% shorter, and it can detect effects 25% to 40% smaller. The kernel estimator's main problem in those designs is that it only uses the cases near the cutoff, and its bias-corrected interval is built to be safe when the curve is bent, so it is wider than it needs to be when the curve is not. With 100 cases the kernel estimator is also erratic, with a few estimates far off and some samples where it cannot produce an estimate at all. That part of my skepticism holds up.
+
+If the curve changes shape at the cutoff, as it does in the two benchmark designs built from real data [@lee2008randomized; @ludwig2007does], the common spline is biased, the bias does not go away with more data, and its intervals miss the true effect far more often than 5% of the time. How biased it is depends on where the knots happen to fall relative to the kink, which is the same kind of fragility I complained about for kernel bandwidths. The kernel estimator handles that case better, since it fits a separate line on each side, although its coverage in the Lee design still falls short as the sample grows. The splines that allow the shape to change at the cutoff do about as well as the kernel estimator there, and give up much of the efficiency advantage in the smooth designs. So the choice is less about kernels versus splines than about what you assume about the curve at the cutoff. A spline that lets the slope and curvature change at the cutoff sits between the two.
+
+The assumption of a common shape is a statement about the treatment effect, not just the curve. If the effect of the treatment varies with the running variable, the two sides will have different slopes even if the untreated outcome is perfectly smooth. In criminology that is plausible for many treatments assigned by a score. A program assigned by a risk score could easily do more for people well above the cutoff than for people just above it, and then the treated side bends away from the untreated side. When the effect is a simple shift, for example a fixed fine or a sentence enhancement applied at a threshold, the common spline is more defensible.
+
+My practical advice is to fit both. Estimate the common spline model and a model that lets the two sides differ (the kernel estimator, or a spline with a slope and curvature change), and plot both fits. If they agree, report the common spline, with its shorter interval. If they disagree, the shape change at the cutoff matters, and the common spline should not be trusted. I would also pick the knot spacing before looking at the outcome rather than by cross-validation, since choosing it from the data made the intervals too narrow, and use more knots with more data (with a few hundred cases 3 knots is plenty, with several thousand it can be too few).
+
+The drunk driving application shows both sides of this. At the 0.08 threshold every model, flexible or not, puts the effect between about 1 and 2 percentage points, so the shape of the curve does not seem to change much there, and the regression models give intervals that exclude zero where the kernel estimator's does not. The kernel estimator's caution costs it the ability to find an effect that Hansen's original regression found. At the 0.05 placebo cutoff, where the curve does bend, the common splines' short intervals turn the bend into a false finding. Plotting the data, as in @fig-hansen, and comparing the common fit to a flexible one would have flagged the bend at 0.05 and given some comfort at 0.08.
+
+That leads to the out-of-sample question. I hoped cross-validated prediction error could settle which model to trust in a given dataset, and it cannot. The differences in prediction error between models are tiny compared with the noise, because the effect estimate depends on the fitted curve at one point and the prediction error averages over all the cases. Averaged over many samples, out-of-sample error caught the large shape change in the Ludwig-Miller design but ranked the models backwards in the Lee design. Within one sample it picked the most accurate model about as often as chance. Validation aimed at the cutoff is a better idea. @imbens2008regression suggested one-sided cross-validation that predicts each case from the cases on the far side of it, and @kettlewell2022optimal choose among RDD specifications by their estimates at placebo cutoffs, where the true effect is zero. Both target the extrapolation to a boundary that the effect estimate depends on. But neither can see a shape change that happens only at the real cutoff, which is the case where the common spline fails.
+
+The machine learning models were the weakest part of the comparison. A tree model is a local average at a boundary, so it is biased wherever the curve has a slope, and that bias did not go away with 5,000 cases. Conformal intervals for the average effect built from the usual out-of-sample errors were far too narrow, for the same reason the jackknife conformal intervals were for synthetic control designs [@wheeler2026synthpower]: the errors that matter are extrapolation errors, and leave-one-out and k-fold errors are interpolation errors. Rolling origin errors that mimic the extrapolation gave intervals with close to the right coverage when the curve is smooth through the cutoff, but not when it changes shape. Individual conformal intervals covered but were too wide to detect any realistic effect. If you want a counterfactual for the treated cases, a regression fit to the control side does better than a tree model, and it has the same no-shape-change assumption behind it.
+
+These simulations have limits. There is one running variable and no covariates, the noise is normal and the same everywhere, and the running variable is continuous, with no heaping or rounding [@kolesar2018inference]. I used rdrobust's defaults, which is what most applied work does, but there are other kernel options: other bandwidth rules [@calonico2020optimal], local quadratic fits [@pei2022local], and bias-aware intervals that bound the curvature directly [@armstrong2018optimal; @armstrong2020simple], which are designed for the coverage shortfall in the Lee design. The spline results also depend on choices I made: natural splines for the common models, a regular knot grid, and the set of knot spacings. Other spline choices, such as penalized splines, could do better.
+
+# AI use disclosure
+
+The code, analysis, and text were produced with Claude Code (Anthropic, Claude Opus 5.5) under my direction. I specified the research question, the comparison of rdrobust to regression splines with knots on a regular grid (skipping and including the cutoff) and a dummy at the cutoff, the random forest and XGBoost models with conformal intervals built from out-of-sample errors, the use of leave-one-out and k-fold error to compare models, the sample sizes, the outcomes to report, and several of the sources to cite. The two splines that let the shape change at the cutoff, the rolling origin intervals, the benchmark designs, and the knot spacing check were added while building the simulation. I chose the drunk driving application from the options it suggested. All numbers and figures are computed from the data and scripts in the repository.
+
+# References {-}
+
+::: {#refs}
+:::
+
+# Appendix {-}
+
+## A. Results at every sample size {-}
+
+```{python}
+#| label: tbl-appendix
+#| output: asis
+rows = []
+for key in R.DGP_ORDER:
+    for n in SIZES:
+        for m in R.CI_MODELS:
+            rows.append({"Design": R.DGP_LABELS[key], "n": com(n), "Model": R.SHORT[m],
+                         "Bias": num(S(key, n, m, "bias")), "RMSE": num(S(key, n, m, "rmse")),
+                         "MAE": num(S(key, n, m, "mae")),
+                         "Coverage": pct(S(key, n, m, "coverage")),
+                         "Length": num(S(key, n, m, "length")),
+                         "False pos.": pct(S(key, n, m, "size")),
+                         "MDE": num(S(key, n, m, "mde80")),
+                         "Knots": num(S(key, n, m, "knots"), 1)})
+print(pd.DataFrame(rows).to_markdown(index=False, disable_numparse=True))
+print()
+print(f": Kernel and spline results for every design and sample size, {com(REPS_FAST)} samples each. rdrobust gave no estimate in {pct(S('lee', 100, 'rdrobust', 'failed'), 1)} of the Lee and {pct(S('lm', 100, 'rdrobust', 'failed'), 1)} of the Ludwig-Miller samples of 100, and in under 0.5% of samples otherwise; every spline gave an estimate in every sample. MAE is the median absolute error. Knots is the average number of interior knots chosen by leave-one-out error. Errors, lengths, and MDE are in units of sigma.")
+```
+
+```{python}
+#| label: tbl-select-all
+#| output: asis
+ss = R.selection_summary(df, R.CI_MODELS)
+rows = []
+for key in R.DGP_ORDER:
+    for n in SIZES:
+        q = ss[(ss.dgp == key) & (ss.n == n)].iloc[0]
+        best = summ[(summ.dgp == key) & (summ.n == n) & summ.model.isin(R.CI_MODELS)].sort_values("rmse").iloc[0]
+        shares = {m: q[f"share_{m}"] for m in R.CI_MODELS}
+        top = max(shares, key=shares.get)
+        rows.append({"Design": R.DGP_LABELS[key], "n": com(n),
+                     "Chosen most": f"{R.SHORT[top]} ({pct(shares[top])})",
+                     "Kernel chosen": pct(shares["rdrobust"]),
+                     "Chose best": pct(q["agree"]), "RMSE chosen": num(q["rmse"]),
+                     "RMSE kernel": num(S(key, n, "rdrobust", "rmse")),
+                     "RMSE best": f"{num(best['rmse'])} ({R.SHORT[best['model']]})",
+                     "Coverage chosen": pct(q["coverage"])})
+print(pd.DataFrame(rows).to_markdown(index=False, disable_numparse=True))
+print()
+print(": Choosing the model with the lowest out-of-sample error in each sample. Chosen most is the model chosen most often and its share. Chose best is the share of samples in which the chosen model had the smallest error of the five. RMSE best is the single model with the lowest RMSE for that design and size.")
+```
+
+## B. Tree models and conformal intervals at every sample size {-}
+
+```{python}
+#| label: tbl-conformal-all
+#| output: asis
+rows = []
+for key in R.DGP_ORDER:
+    for n in SIZES:
+        for m in ["spline_sep", "rf", "xgb"]:
+            rows.append({"Design": R.DGP_LABELS[key], "n": com(n), "Model": R.SHORT[m],
+                         "Bias": num(S(key, n, m, "bias")), "RMSE": num(S(key, n, m, "rmse")),
+                         "Ind. cov.": pct(C(key, n, m, "ind_cov")),
+                         "Ind. length": num(C(key, n, m, "ind_len"), 1),
+                         "Avg. cov.": pct(C(key, n, m, "avg_cov")),
+                         "Rolling cov.": pct(C(key, n, m, "avgro_cov")),
+                         "Rolling length": num(C(key, n, m, "avgro_len"))})
+print(pd.DataFrame(rows).to_markdown(index=False, disable_numparse=True))
+print()
+print(f": Estimates and conformal intervals for the models with a control-side counterfactual, {com(REPS_TREES)} samples per design and size. Bias and RMSE are for the estimate at the cutoff (all {com(REPS_FAST)} samples for the separate splines); the coverage and length columns are as in @tbl-conformal.")
+```
