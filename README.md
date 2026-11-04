@@ -18,7 +18,8 @@ Hansen (2015).
 
 The paper is `paper.pdf` (also built as `paper.md`), from `paper.qmd` and
 `references.bib`. Working title: "Just use regression (most of the time) for
-RDD".
+RDD". `SplineRDD_Convo.txt` is the Claude Code conversation that generated the
+code, analysis, and paper.
 
 ## Reproducing
 
@@ -55,6 +56,7 @@ outcomes, which is why each sample only needs to be simulated once.
 ## Layout
 
 - `paper.qmd`, `references.bib` -- paper source and bibliography.
+- `SplineRDD_Convo.txt` -- the Claude Code conversation that generated the paper.
 - `src/splinerdd/` -- the designs (`dgp.py`), the estimators, out-of-sample
   errors and conformal pieces (`estimators.py`), one simulation replication
   (`sim.py`), the drunk driving data (`hansen.py`), and the summaries used in
